@@ -1,8 +1,0 @@
-streamlit
-langchain
-langchain-community
-langchain-groq
-faiss-cpu
-pypdf
-tiktoken
-sentence-transformers
