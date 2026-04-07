@@ -1,209 +1,256 @@
 import streamlit as st
-import os, time, base64, pandas as pd
+import os, time, base64, json
+import pandas as pd
 import plotly.express as px
+
 from langchain.chains import RetrievalQA
 from langchain_groq import ChatGroq
+
 from modules.loader import load_documents
 from modules.chunking import split_documents
 from modules.embeddings import create_embeddings
 from modules.vector_store import create_vector_store
 from config import GROQ_API_KEY
 
-# ------------------------- PAGE CONFIG -------------------------
-st.set_page_config(page_title="Enterprise RAG Assistant", page_icon="🤖", layout="wide")
 
-# ------------------------- STYLING -------------------------
-st.markdown("""
-<style>
-/* Background gradient */
-.stApp { background: linear-gradient(135deg, #020617, #0f172a); color: white; font-family: 'Segoe UI', sans-serif; }
+# ------------------ CONFIG ------------------
+st.set_page_config(page_title="RAG Assistant", page_icon="🤖", layout="wide")
 
-/* Header */
-.header { background: linear-gradient(90deg,#2563eb,#4f46e5); padding: 18px; border-radius: 12px; font-size: 28px; font-weight: 700; text-align:center; margin-bottom: 20px; color:white; }
+UPLOAD_DIR = "uploads"
+USER_FILE = "users.json"
 
-/* Cards */
-.card { background: rgba(255,255,255,0.05); padding: 20px; border-radius: 16px; margin-bottom: 20px; border: 1px solid rgba(255,255,255,0.1); box-shadow: 0 8px 32px rgba(31,38,135,0.37); backdrop-filter: blur(8px); }
-
-/* Metrics */
-.metric { font-size: 32px; font-weight:bold; margin-top:10px; color: #60a5fa; }
-
-/* Chat container */
-.chat-container { max-height: 550px; overflow-y: auto; padding: 12px; border-radius: 16px; background: rgba(255,255,255,0.05); backdrop-filter: blur(8px); margin-bottom: 20px; }
-
-/* Chat bubbles */
-.stChatMessage_user > div:first-child { background: linear-gradient(135deg,#2563eb,#60a5fa); color:white; border-radius:20px !important; padding:12px !important; box-shadow:0 4px 10px rgba(0,0,0,0.2); }
-.stChatMessage_assistant > div:first-child { background: linear-gradient(135deg,#4f46e5,#a78bfa); color:white; border-radius:20px !important; padding:12px !important; box-shadow:0 4px 10px rgba(0,0,0,0.2); }
-
-/* Sidebar */
-.sidebar .sidebar-content { background: linear-gradient(180deg,#111827,#1e293b); color:white; }
-
-/* Input box */
-.stTextInput>div>div>input { border-radius:12px; padding:10px; background-color: rgba(255,255,255,0.1); color:white; }
-</style>
-""", unsafe_allow_html=True)
-
-st.markdown('<div class="header">🏢 Enterprise RAG Knowledge Assistant</div>', unsafe_allow_html=True)
-
-# ------------------------- AUTH / SESSION -------------------------
-USERS = {
-    "admin":{"password":"admin123","role":"admin"},
-    "user1":{"password":"user123","role":"user"},
-    "user2":{"password":"user234","role":"user"}
-}
-UPLOAD_DIR="uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
+
+# ------------------ USER STORAGE ------------------
+def load_users():
+    if not os.path.exists(USER_FILE):
+        return {}
+    with open(USER_FILE, "r") as f:
+        return json.load(f)
+
+def save_users(users):
+    with open(USER_FILE, "w") as f:
+        json.dump(users, f)
+
+
+# ------------------ SESSION ------------------
 if "logged_in" not in st.session_state:
-    st.session_state.logged_in=False
-    st.session_state.username=""
-    st.session_state.role=""
+    st.session_state.logged_in = False
+    st.session_state.username = ""
+    st.session_state.role = ""
+    st.session_state.messages = []
+    st.session_state.query_count = {}
+    st.session_state.response_times = []
 
+
+# ------------------ LOGIN / SIGNUP ------------------
 if not st.session_state.logged_in:
-    st.subheader("🔐 Login")
-    with st.form("login_form"):
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-        submitted = st.form_submit_button("Login")
-        if submitted:
-            if username in USERS and USERS[username]["password"]==password:
-                st.session_state.logged_in=True
-                st.session_state.username=username
-                st.session_state.role=USERS[username]["role"]
-                st.success(f"Logged in as {username} ({st.session_state.role})")
-            else:
-                st.error("Invalid credentials")
+
+    col1, col2, col3 = st.columns([1,1.2,1])
+
+    with col2:
+        st.markdown("### 🔐 Account Access")
+
+        tab1, tab2 = st.tabs(["Login", "Create Account"])
+
+        users = load_users()
+
+        # -------- LOGIN --------
+        with tab1:
+            with st.form("login_form"):
+                username = st.text_input("Username").strip()
+                password = st.text_input("Password", type="password").strip()
+                login_btn = st.form_submit_button("Login")
+
+                if login_btn:
+                    user = users.get(username)
+                    if user and user["password"] == password:
+                        st.session_state.logged_in = True
+                        st.session_state.username = username
+                        st.session_state.role = user["role"]
+                        st.rerun()
+                    else:
+                        st.error("Invalid username or password")
+
+        # -------- SIGNUP --------
+        with tab2:
+            with st.form("signup_form"):
+                new_user = st.text_input("New Username").strip()
+                new_pass = st.text_input("New Password", type="password").strip()
+                role = st.selectbox("Role", ["user", "admin"])
+                signup_btn = st.form_submit_button("Create Account")
+
+                if signup_btn:
+                    if new_user in users:
+                        st.warning("Username already exists")
+                    elif not new_user or not new_pass:
+                        st.warning("Fill all fields")
+                    else:
+                        users[new_user] = {
+                            "password": new_pass,
+                            "role": role
+                        }
+                        save_users(users)
+                        st.success("Account created! Go to Login tab.")
+
     st.stop()
 
-# ------------------------- SESSION STATE -------------------------
-if "messages" not in st.session_state: st.session_state.messages=[]
-if "query_count" not in st.session_state: st.session_state.query_count={}
-if "response_times" not in st.session_state: st.session_state.response_times=[]
 
-st.markdown(f"**Logged in as:** {st.session_state.username} ({st.session_state.role})")
+# ------------------ HEADER ------------------
+st.title("🏢 Enterprise RAG Assistant")
+st.write(f"Logged in as **{st.session_state.username}** ({st.session_state.role})")
+
 if st.button("Logout"):
-    st.session_state.logged_in=False
-    st.session_state.username=""
-    st.session_state.role=""
+    st.session_state.logged_in = False
+    st.rerun()
+
+
+# ------------------ STATS ------------------
+files = os.listdir(UPLOAD_DIR)
+
+total_docs = len(files)
+total_queries = sum(st.session_state.query_count.values())
+avg_time = round(sum(st.session_state.response_times)/len(st.session_state.response_times),2) if st.session_state.response_times else 0
+
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Documents", total_docs)
+c2.metric("Queries", total_queries)
+c3.metric("Avg Time", f"{avg_time}s")
+c4.metric("Model", "Groq")
+
+
+# ------------------ SIDEBAR ------------------
+st.sidebar.title("📂 Documents")
+
+if st.session_state.role == "admin":
+    uploads = st.sidebar.file_uploader("Upload PDFs", type=["pdf"], accept_multiple_files=True)
+
+    if uploads:
+        for file in uploads:
+            with open(os.path.join(UPLOAD_DIR, file.name), "wb") as f:
+                f.write(file.getbuffer())
+        st.sidebar.success("Uploaded")
+
+st.sidebar.subheader("Files")
+for f in files:
+    st.sidebar.write("📄", f)
+
+
+# ------------------ RAG CHAIN ------------------
+@st.cache_resource
+def get_chain():
+    docs = []
+
+    for f in os.listdir(UPLOAD_DIR):
+        if f.endswith(".pdf"):
+            docs.extend(load_documents(os.path.join(UPLOAD_DIR, f)))
+
+    if not docs:
+        return None
+
+    chunks = split_documents(docs)
+    embeddings = create_embeddings()
+    store = create_vector_store(chunks, embeddings)
+
+    llm = ChatGroq(
+        groq_api_key=GROQ_API_KEY,
+        model_name="llama-3.1-8b-instant"
+    )
+
+    return RetrievalQA.from_chain_type(
+        llm=llm,
+        retriever=store.as_retriever(k=3),
+        return_source_documents=True
+    )
+
+
+qa = get_chain()
+
+if not qa:
+    st.warning("Upload PDFs to start chatting")
     st.stop()
 
-# ------------------------- DASHBOARD STATS -------------------------
-cols = st.columns(4)
-total_docs=len(os.listdir(UPLOAD_DIR))
-total_queries=sum(st.session_state.query_count.values())
-avg_time = round(sum(st.session_state.response_times)/len(st.session_state.response_times),2) if st.session_state.response_times else 0
-cols[0].markdown(f'<div class="card">📄 Documents<div class="metric">{total_docs}</div></div>', unsafe_allow_html=True)
-cols[1].markdown(f'<div class="card">📊 Queries<div class="metric">{total_queries}</div></div>', unsafe_allow_html=True)
-cols[2].markdown(f'<div class="card">⚡ Avg Response<div class="metric">{avg_time}s</div></div>', unsafe_allow_html=True)
-cols[3].markdown(f'<div class="card">🚀 Model<div class="metric">Groq</div></div>', unsafe_allow_html=True)
 
-# ------------------------- SIDEBAR -------------------------
-st.sidebar.title("📂 Document Manager")
-if st.session_state.role=="admin":
-    uploaded_files=st.sidebar.file_uploader("Upload PDFs", type=["pdf"], accept_multiple_files=True)
-    if uploaded_files:
-        for file in uploaded_files:
-            path=os.path.join(UPLOAD_DIR,file.name)
-            with open(path,"wb") as f: f.write(file.getbuffer())
-        st.sidebar.success("Upload complete")
+# ------------------ LAYOUT ------------------
+left, right = st.columns([1,2])
 
-st.sidebar.subheader("Uploaded Documents")
-files=os.listdir(UPLOAD_DIR)
-for file in files:
-    colA,colB=st.sidebar.columns([4,1])
-    with colA: st.write(file)
-    with colB:
-        if st.session_state.role=="admin" and st.button("❌",key=file):
-            os.remove(f"{UPLOAD_DIR}/{file}")
-            st.cache_resource.clear()
-            st.stop()
 
-# ------------------------- PDF VIEW -------------------------
-def display_pdf(file):
-    with open(file,"rb") as f: base64_pdf=base64.b64encode(f.read()).decode()
-    pdf=f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="500px"></iframe>'
-    st.markdown(pdf, unsafe_allow_html=True)
-
-# ------------------------- QA CHAIN -------------------------
-@st.cache_resource
-def build_qa_chain():
-    docs=[]
-    for file in os.listdir(UPLOAD_DIR):
-        if file.endswith(".pdf"): docs.extend(load_documents(f"{UPLOAD_DIR}/{file}"))
-    if len(docs)==0: return None
-    chunks=split_documents(docs)
-    embeddings=create_embeddings()
-    vectorstore=create_vector_store(chunks, embeddings)
-    retriever=vectorstore.as_retriever(search_kwargs={"k":3})
-    llm=ChatGroq(groq_api_key=GROQ_API_KEY, model_name="llama-3.1-8b-instant")
-    return RetrievalQA.from_chain_type(llm=llm,retriever=retriever,return_source_documents=True)
-
-qa_chain=build_qa_chain()
-if qa_chain is None: st.warning("Upload PDFs to enable AI chat"); st.stop()
-
-# ------------------------- MAIN LAYOUT -------------------------
-left,right=st.columns([1,2])
-
-# LEFT - Documents
+# -------- DOCUMENT VIEW --------
 with left:
-    st.markdown('<div class="card">', unsafe_allow_html=True)
     st.subheader("📄 Documents")
-    files=os.listdir(UPLOAD_DIR)
-    for f in files: st.write("📄",f)
+
+    for f in files:
+        st.write("📄", f)
+
     if files:
-        selected=st.selectbox("Preview PDF", files)
-        display_pdf(f"{UPLOAD_DIR}/{selected}")
-        st.download_button("Download PDF", data=open(f"{UPLOAD_DIR}/{selected}", "rb").read(), file_name=selected)
-    st.markdown('</div>', unsafe_allow_html=True)
+        selected = st.selectbox("Preview", files)
 
-# RIGHT - AI Chat
+        with open(os.path.join(UPLOAD_DIR, selected), "rb") as f:
+            pdf = base64.b64encode(f.read()).decode()
+
+        st.markdown(
+            f'<iframe src="data:application/pdf;base64,{pdf}" width="100%" height="400"></iframe>',
+            unsafe_allow_html=True
+        )
+
+
+# -------- CHAT --------
 with right:
-    st.markdown('<div class="card chat-container">', unsafe_allow_html=True)
-    st.subheader("🤖 AI Chat")
+    st.subheader("🤖 Chat")
 
-    # Display chat messages
-    for m in st.session_state.messages:
-        with st.chat_message(m["role"]): st.markdown(m["content"])
+    col1, col2 = st.columns(2)
 
-    # Chat input with typing animation
-    question=st.chat_input("Ask question from documents...")
-    if question:
-        st.session_state.messages.append({"role":"user","content":question})
-        st.session_state.query_count[question]=st.session_state.query_count.get(question,0)+1
-
-        start_time = time.time()
-        with st.chat_message("assistant"):
-            placeholder=st.empty()
-            # Typing effect
-            for i in range(3):
-                placeholder.markdown("Typing" + "."*(i+1))
-                time.sleep(0.3)
-            response=qa_chain.invoke({"query":question})
-            answer=response["result"]
-            placeholder.markdown(answer)
-            st.session_state.messages.append({"role":"assistant","content":answer})
-            # Show source documents
-            for s in response["source_documents"]:
-                st.caption(f"📄 {s.metadata.get('source','Document')}")
-        st.session_state.response_times.append(round(time.time()-start_time,2))
-
-    # Clear chat & download
-    colC,colD=st.columns(2)
-    with colC:
+    with col1:
         if st.button("🧹 Clear Chat"):
-            st.session_state.messages=[]
-            st.stop()
-    with colD:
+            st.session_state.messages = []
+            st.session_state.query_count = {}
+            st.session_state.response_times = []
+            st.rerun()
+
+    with col2:
         if st.session_state.messages:
-            chat_text="\n".join([f"{m['role'].title()}: {m['content']}" for m in st.session_state.messages])
-            st.download_button("💾 Download Chat", data=chat_text, file_name="chat_history.txt")
+            chat_text = "\n".join(
+                [f"{m['role'].title()}: {m['content']}" for m in st.session_state.messages]
+            )
+            st.download_button("💾 Download Chat", chat_text, file_name="chat.txt", mime="text/plain")
 
-    st.markdown('</div>', unsafe_allow_html=True)
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
 
-# ------------------------- QUERY ANALYTICS -------------------------
-st.subheader("📊 Query Analytics")
+    question = st.chat_input("Ask something...")
+
+    if question:
+        st.session_state.messages.append({"role": "user", "content": question})
+
+        start = time.time()
+
+        with st.chat_message("assistant"):
+            res = qa.invoke({"query": question})
+            answer = res["result"]
+
+            st.markdown(answer)
+
+            for doc in res["source_documents"]:
+                st.caption(doc.metadata.get("source", "Document"))
+
+        st.session_state.messages.append({"role": "assistant", "content": answer})
+
+        st.session_state.query_count[question] = st.session_state.query_count.get(question, 0) + 1
+        st.session_state.response_times.append(round(time.time() - start, 2))
+
+
+# ------------------ ANALYTICS ------------------
+st.subheader("📊 Analytics")
+
 if st.session_state.query_count:
-    df=pd.DataFrame(st.session_state.query_count.items(),columns=["Query","Count"]).sort_values("Count",ascending=False)
-    fig=px.bar(df,x="Query",y="Count",text="Count",color="Count")
-    st.plotly_chart(fig,use_container_width=True)
+    df = pd.DataFrame(
+        st.session_state.query_count.items(),
+        columns=["Query", "Count"]
+    ).sort_values("Count", ascending=False)
+
+    fig = px.bar(df, x="Query", y="Count", text="Count")
+    st.plotly_chart(fig, use_container_width=True)
 else:
-    st.info("No analytics yet")
+    st.info("No data yet")
