@@ -7,5 +7,6 @@ faiss-cpu
 pypdf
 tiktoken
 sentence-transformers
-plotly>=5.0.0
+plotly
 pandas
+pydantic==1.10.13
